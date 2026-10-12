@@ -11,3 +11,16 @@ __pycache__/
 # Operating system files
 .DS_Store
 Thumbs.db
+# STM32CubeIDE
+**/Debug/
+**/Release/
+**/.metadata/
+
+# Generated build files
+*.elf
+*.hex
+*.bin
+*.map
+*.list
+*.o
+*.d
