@@ -36,9 +36,8 @@
 /* M2 mechanical break requires 100 ms to fully release */
 #define BREAK_RELEASE_MS     100U
 
-#define START_M1_POSITION   (-4088L)
-#define START_M2_POSITION   (4650L)
-#define START_M3_POSITION   (-4267L)
+#define START_M1_POSITION   (-2024L)
+#define START_M2_POSITION   (-4669L)
 
 /* USER CODE END PD */
 
@@ -57,27 +56,7 @@ static struct udp_pcb *udp_pcb_global;
 
 /* Manual mode owns M2 break until explicitly disabled. */
 static uint8_t manual_mode_active = 0U;
-
-/* Tracking: bounded simultaneous M1/M3 STEP pulses, no M2 motion. */
-#define TRACK_MAX_STEPS 10L
-#define TRACK_STEP_TOGGLE_MS 2U
-static uint8_t track_active = 0U;
-static uint8_t track_step_high = 0U;
-static uint8_t track_wait_dir = 0U;
-static uint32_t track_dir_time = 0U;
-static uint32_t track_last_tick = 0U;
-static uint32_t track_slots = 0U;
-static uint32_t track_slot = 0U;
-static uint32_t track_m1_steps = 0U;
-static uint32_t track_m3_steps = 0U;
-static uint32_t track_m1_acc = 0U;
-static uint32_t track_m3_acc = 0U;
-static GPIO_PinState track_m1_dir = GPIO_PIN_RESET;
-static GPIO_PinState track_m3_dir = GPIO_PIN_RESET;
-static ip_addr_t track_reply_addr;
-static u16_t track_reply_port = 0U;
-
-
+static uint8_t zero_reference_set = 0U;
 
 /* ============================================================= */
 /* MOTOR 1                                                       */
@@ -114,23 +93,6 @@ static int32_t m2_position = 0;
 
 
 /* ============================================================= */
-/* MOTOR 3                                                       */
-/* ============================================================= */
-
-static uint8_t m3_running = 0U;
-static uint32_t m3_last_command_time = 0U;
-static uint32_t m3_last_step_time = 0U;
-
-static GPIO_PinState m3_direction = GPIO_PIN_RESET;
-
-static uint32_t m3_dir_change_time = 0U;
-static uint8_t m3_waiting_for_dir = 0U;
-static uint8_t m3_step_state = 0U;
-
-static int32_t m3_position = 0;
-
-
-/* ============================================================= */
 /* AUTOMATIC COORDINATED MOVE                                    */
 /* ============================================================= */
 
@@ -143,18 +105,15 @@ static uint32_t auto_move_last_step_time = 0U;
 
 static uint32_t auto_m1_steps = 0U;
 static uint32_t auto_m2_steps = 0U;
-static uint32_t auto_m3_steps = 0U;
 
 static GPIO_PinState auto_m1_direction = GPIO_PIN_RESET;
 static GPIO_PinState auto_m2_direction = GPIO_PIN_RESET;
-static GPIO_PinState auto_m3_direction = GPIO_PIN_RESET;
 
 static uint32_t auto_total_slots = 0U;
 static uint32_t auto_slot = 0U;
 
 static uint32_t auto_m1_accumulator = 0U;
 static uint32_t auto_m2_accumulator = 0U;
-static uint32_t auto_m3_accumulator = 0U;
 
 static ip_addr_t auto_reply_addr;
 static u16_t auto_reply_port = 0U;
@@ -173,10 +132,6 @@ static void MX_USB_OTG_FS_PCD_Init(void);
 
 /* USER CODE BEGIN PFP */
 
-static void Track_Stop(void);
-static void Track_Start(int32_t m1_steps, int32_t m3_steps,
-                        const ip_addr_t *addr, u16_t port);
-static void Track_Process(void);
 static void UDP_Init(void);
 
 static void UDP_ReceiveCallback(
@@ -206,10 +161,6 @@ static void M2_Start(GPIO_PinState direction);
 static void M2_Stop(void);
 static void M2_Process(void);
 
-static void M3_Start(GPIO_PinState direction);
-static void M3_Stop(void);
-static void M3_Process(void);
-
 static void Stop_All_Motors(void);
 
 static void Reset_Position(void);
@@ -220,7 +171,6 @@ static void M2_BreakEngage(void);
 static void Auto_MoveStart(
     int32_t target_m1,
     int32_t target_m2,
-    int32_t target_m3,
     const ip_addr_t *addr,
     u16_t port
 );
@@ -263,123 +213,6 @@ static void M2_BreakEngage(void)
     );
 }
 
-
-/* ============================================================= */
-/* TRACKING: bounded coordinated M1/M3 move                     */
-/* ============================================================= */
-static void Track_Stop(void)
-{
-    track_active = 0U;
-    track_step_high = 0U;
-    track_wait_dir = 0U;
-    HAL_GPIO_WritePin(M1_step_GPIO_Port, M1_step_Pin, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(M3_step_GPIO_Port, M3_step_Pin, GPIO_PIN_RESET);
-}
-
-static void Track_Start(int32_t m1_steps, int32_t m3_steps,
-                        const ip_addr_t *addr, u16_t port)
-{
-    uint32_t now;
-    /* Never interrupt manual mode, jog movement or GO TO START. */
-    if (manual_mode_active || auto_move_active ||
-        m1_running || m2_running || m3_running || track_active)
-    {
-        UDP_SendReply("TRACK_BUSY", addr, port);
-        return;
-    }
-
-    if (m1_steps > TRACK_MAX_STEPS || m1_steps < -TRACK_MAX_STEPS ||
-        m3_steps > TRACK_MAX_STEPS || m3_steps < -TRACK_MAX_STEPS)
-    {
-        UDP_SendReply("TRACK_INVALID", addr, port);
-        return;
-    }
-
-    track_m1_steps = (uint32_t)(m1_steps < 0 ? -m1_steps : m1_steps);
-    track_m3_steps = (uint32_t)(m3_steps < 0 ? -m3_steps : m3_steps);
-    track_slots = track_m1_steps > track_m3_steps ? track_m1_steps : track_m3_steps;
-    if (track_slots == 0U)
-    {
-        UDP_SendReply("TRACK_DONE", addr, port);
-        return;
-    }
-
-    track_m1_dir = m1_steps >= 0 ? GPIO_PIN_SET : GPIO_PIN_RESET;
-    track_m3_dir = m3_steps >= 0 ? GPIO_PIN_SET : GPIO_PIN_RESET;
-    HAL_GPIO_WritePin(M1_step_GPIO_Port, M1_step_Pin, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(M3_step_GPIO_Port, M3_step_Pin, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(M1_dir_GPIO_Port, M1_dir_Pin, track_m1_dir);
-    HAL_GPIO_WritePin(M3_dir_GPIO_Port, M3_dir_Pin, track_m3_dir);
-    m1_direction = track_m1_dir;
-    m3_direction = track_m3_dir;
-    track_m1_acc = track_slots / 2U;
-    track_m3_acc = track_slots / 2U;
-    track_slot = 0U;
-    track_step_high = 0U;
-    now = HAL_GetTick();
-    track_dir_time = now;
-    track_last_tick = now;
-    track_wait_dir = 1U;
-    ip_addr_copy(track_reply_addr, *addr);
-    track_reply_port = port;
-    track_active = 1U;
-}
-
-static void Track_Process(void)
-{
-    uint32_t now;
-    uint8_t pulse1 = 0U, pulse3 = 0U;
-    if (!track_active) return;
-    now = HAL_GetTick();
-    if (track_wait_dir)
-    {
-        if ((uint32_t)(now - track_dir_time) < DIR_SETTLE_MS) return;
-        track_wait_dir = 0U;
-        track_last_tick = now;
-        return;
-    }
-    if ((uint32_t)(now - track_last_tick) < TRACK_STEP_TOGGLE_MS) return;
-    track_last_tick = now;
-
-    if (!track_step_high)
-    {
-        track_m1_acc += track_m1_steps;
-        if (track_m1_acc >= track_slots)
-        {
-            track_m1_acc -= track_slots;
-            pulse1 = 1U;
-        }
-        track_m3_acc += track_m3_steps;
-        if (track_m3_acc >= track_slots)
-        {
-            track_m3_acc -= track_slots;
-            pulse3 = 1U;
-        }
-        if (pulse1)
-        {
-            HAL_GPIO_WritePin(M1_step_GPIO_Port, M1_step_Pin, GPIO_PIN_SET);
-            m1_position += (track_m1_dir == GPIO_PIN_SET) ? 1 : -1;
-        }
-        if (pulse3)
-        {
-            HAL_GPIO_WritePin(M3_step_GPIO_Port, M3_step_Pin, GPIO_PIN_SET);
-            m3_position += (track_m3_dir == GPIO_PIN_SET) ? 1 : -1;
-        }
-        track_step_high = 1U;
-        track_slot++;
-    }
-    else
-    {
-        HAL_GPIO_WritePin(M1_step_GPIO_Port, M1_step_Pin, GPIO_PIN_RESET);
-        HAL_GPIO_WritePin(M3_step_GPIO_Port, M3_step_Pin, GPIO_PIN_RESET);
-        track_step_high = 0U;
-        if (track_slot >= track_slots)
-        {
-            track_active = 0U;
-            UDP_SendReply("TRACK_DONE", &track_reply_addr, track_reply_port);
-        }
-    }
-}
 
 /* ============================================================= */
 /* UDP INITIALIZATION                                            */
@@ -484,10 +317,9 @@ static void UDP_SendPosition(
     snprintf(
         message,
         sizeof(message),
-        "POS,%ld,%ld,%ld",
+        "POS,%ld,%ld",
         (long)m1_position,
-        (long)m2_position,
-        (long)m3_position
+        (long)m2_position
     );
 
     UDP_SendReply(
@@ -506,7 +338,6 @@ static void Reset_Position(void)
 {
     m1_position = 0;
     m2_position = 0;
-    m3_position = 0;
 }
 
 
@@ -570,22 +401,7 @@ static void M2_Stop(void)
 }
 
 
-/* ============================================================= */
-/* MOTOR 3 STOP                                                  */
-/* ============================================================= */
 
-static void M3_Stop(void)
-{
-    m3_running = 0U;
-    m3_waiting_for_dir = 0U;
-    m3_step_state = 0U;
-
-    HAL_GPIO_WritePin(
-        M3_step_GPIO_Port,
-        M3_step_Pin,
-        GPIO_PIN_RESET
-    );
-}
 
 
 /* ============================================================= */
@@ -596,7 +412,6 @@ static void Stop_All_Motors(void)
 {
     M1_Stop();
     M2_Stop();
-    M3_Stop();
 }
 
 
@@ -854,131 +669,10 @@ static void M2_Process(void)
 }
 
 
-/* ============================================================= */
-/* MOTOR 3 START                                                 */
-/* ============================================================= */
-
-static void M3_Start(
-    GPIO_PinState direction
-)
-{
-    uint32_t now;
-
-    if (auto_move_active != 0U)
-    {
-        Auto_MoveStop();
-    }
-
-    now = HAL_GetTick();
-
-    if (
-        (m3_running == 0U) ||
-        (m3_direction != direction)
-    )
-    {
-        HAL_GPIO_WritePin(
-            M3_step_GPIO_Port,
-            M3_step_Pin,
-            GPIO_PIN_RESET
-        );
-
-        m3_step_state = 0U;
-
-        HAL_GPIO_WritePin(
-            M3_dir_GPIO_Port,
-            M3_dir_Pin,
-            direction
-        );
-
-        m3_direction = direction;
-        m3_dir_change_time = now;
-        m3_last_step_time = now;
-        m3_waiting_for_dir = 1U;
-    }
-
-    m3_last_command_time = now;
-    m3_running = 1U;
-}
 
 
-/* ============================================================= */
-/* MOTOR 3 PROCESS                                               */
-/* ============================================================= */
 
-static void M3_Process(void)
-{
-    uint32_t now;
 
-    if (m3_running == 0U)
-    {
-        return;
-    }
-
-    now = HAL_GetTick();
-
-    if (
-        (now - m3_last_command_time) >=
-        COMMAND_TIMEOUT_MS
-    )
-    {
-        M3_Stop();
-        return;
-    }
-
-    if (m3_waiting_for_dir != 0U)
-    {
-        if (
-            (now - m3_dir_change_time) <
-            DIR_SETTLE_MS
-        )
-        {
-            return;
-        }
-
-        m3_waiting_for_dir = 0U;
-        m3_last_step_time = now;
-
-        return;
-    }
-
-    if (
-        (now - m3_last_step_time) >=
-        STEP_TOGGLE_MS
-    )
-    {
-        m3_last_step_time = now;
-
-        if (m3_step_state == 0U)
-        {
-            HAL_GPIO_WritePin(
-                M3_step_GPIO_Port,
-                M3_step_Pin,
-                GPIO_PIN_SET
-            );
-
-            m3_step_state = 1U;
-
-            if (m3_direction == GPIO_PIN_SET)
-            {
-                m3_position++;
-            }
-            else
-            {
-                m3_position--;
-            }
-        }
-        else
-        {
-            HAL_GPIO_WritePin(
-                M3_step_GPIO_Port,
-                M3_step_Pin,
-                GPIO_PIN_RESET
-            );
-
-            m3_step_state = 0U;
-        }
-    }
-}
 
 
 /* ============================================================= */
@@ -1004,15 +698,8 @@ static void Auto_MoveStop(void)
         GPIO_PIN_RESET
     );
 
-    HAL_GPIO_WritePin(
-        M3_step_GPIO_Port,
-        M3_step_Pin,
-        GPIO_PIN_RESET
-    );
-
     m1_step_state = 0U;
     m2_step_state = 0U;
-    m3_step_state = 0U;
 }
 
 
@@ -1023,7 +710,6 @@ static void Auto_MoveStop(void)
 static void Auto_MoveStart(
     int32_t target_m1,
     int32_t target_m2,
-    int32_t target_m3,
     const ip_addr_t *addr,
     u16_t port
 )
@@ -1051,13 +737,6 @@ static void Auto_MoveStart(
             m2_position
         );
 
-    auto_m3_steps =
-        Abs_Difference(
-            target_m3,
-            m3_position
-        );
-
-
     if (target_m1 >= m1_position)
     {
         auto_m1_direction = GPIO_PIN_SET;
@@ -1078,28 +757,12 @@ static void Auto_MoveStart(
     }
 
 
-    if (target_m3 >= m3_position)
-    {
-        auto_m3_direction = GPIO_PIN_SET;
-    }
-    else
-    {
-        auto_m3_direction = GPIO_PIN_RESET;
-    }
-
-
     auto_total_slots = auto_m1_steps;
 
 
     if (auto_m2_steps > auto_total_slots)
     {
         auto_total_slots = auto_m2_steps;
-    }
-
-
-    if (auto_m3_steps > auto_total_slots)
-    {
-        auto_total_slots = auto_m3_steps;
     }
 
 
@@ -1159,16 +822,8 @@ static void Auto_MoveStart(
         auto_m2_direction
     );
 
-    HAL_GPIO_WritePin(
-        M3_dir_GPIO_Port,
-        M3_dir_Pin,
-        auto_m3_direction
-    );
-
-
     m1_direction = auto_m1_direction;
     m2_direction = auto_m2_direction;
-    m3_direction = auto_m3_direction;
 
 
     /*
@@ -1187,13 +842,6 @@ static void Auto_MoveStart(
         GPIO_PIN_RESET
     );
 
-    HAL_GPIO_WritePin(
-        M3_step_GPIO_Port,
-        M3_step_Pin,
-        GPIO_PIN_RESET
-    );
-
-
     /*
      * Initialize DDA accumulators.
      */
@@ -1204,8 +852,6 @@ static void Auto_MoveStart(
     auto_m2_accumulator =
         auto_total_slots / 2U;
 
-    auto_m3_accumulator =
-        auto_total_slots / 2U;
 
 
     auto_slot = 0U;
@@ -1243,7 +889,6 @@ static void Auto_MoveProcess(void)
 
     uint8_t m1_pulse;
     uint8_t m2_pulse;
-    uint8_t m3_pulse;
 
 
     if (auto_move_active == 0U)
@@ -1296,7 +941,6 @@ static void Auto_MoveProcess(void)
     {
         m1_pulse = 0U;
         m2_pulse = 0U;
-        m3_pulse = 0U;
 
 
         auto_m1_accumulator +=
@@ -1328,22 +972,6 @@ static void Auto_MoveProcess(void)
                 auto_total_slots;
 
             m2_pulse = 1U;
-        }
-
-
-        auto_m3_accumulator +=
-            auto_m3_steps;
-
-
-        if (
-            auto_m3_accumulator >=
-            auto_total_slots
-        )
-        {
-            auto_m3_accumulator -=
-                auto_total_slots;
-
-            m3_pulse = 1U;
         }
 
 
@@ -1396,28 +1024,6 @@ static void Auto_MoveProcess(void)
         }
 
 
-        if (m3_pulse != 0U)
-        {
-            HAL_GPIO_WritePin(
-                M3_step_GPIO_Port,
-                M3_step_Pin,
-                GPIO_PIN_SET
-            );
-
-            if (
-                auto_m3_direction ==
-                GPIO_PIN_SET
-            )
-            {
-                m3_position++;
-            }
-            else
-            {
-                m3_position--;
-            }
-        }
-
-
         auto_slot++;
 
         auto_move_step_high = 1U;
@@ -1440,13 +1046,6 @@ static void Auto_MoveProcess(void)
             M2_step_Pin,
             GPIO_PIN_RESET
         );
-
-        HAL_GPIO_WritePin(
-            M3_step_GPIO_Port,
-            M3_step_Pin,
-            GPIO_PIN_RESET
-        );
-
 
         auto_move_step_high = 0U;
 
@@ -1564,7 +1163,6 @@ static void UDP_ReceiveCallback(
         ) == 0
     )
     {
-        Track_Stop();
         Auto_MoveStop();
 
         Stop_All_Motors();
@@ -1607,7 +1205,6 @@ static void UDP_ReceiveCallback(
         ) == 0
     )
     {
-        Track_Stop();
         Auto_MoveStop();
 
         Stop_All_Motors();
@@ -1635,11 +1232,9 @@ static void UDP_ReceiveCallback(
         ) == 0
     )
     {
-        Track_Stop();
         Auto_MoveStop();
 
         M2_Stop();
-        M3_Stop();
 
 
         M1_Start(
@@ -1666,11 +1261,9 @@ static void UDP_ReceiveCallback(
         ) == 0
     )
     {
-        Track_Stop();
         Auto_MoveStop();
 
         M2_Stop();
-        M3_Stop();
 
 
         M1_Start(
@@ -1697,11 +1290,9 @@ static void UDP_ReceiveCallback(
         ) == 0
     )
     {
-        Track_Stop();
         Auto_MoveStop();
 
         M1_Stop();
-        M3_Stop();
 
 
         M2_Start(
@@ -1728,11 +1319,9 @@ static void UDP_ReceiveCallback(
         ) == 0
     )
     {
-        Track_Stop();
         Auto_MoveStop();
 
         M1_Stop();
-        M3_Stop();
 
 
         M2_Start(
@@ -1742,68 +1331,6 @@ static void UDP_ReceiveCallback(
 
         UDP_SendReply(
             "M2_DOWN",
-            addr,
-            port
-        );
-    }
-
-
-    /* --------------------------------------------------------- */
-    /* MOTOR 3 UP                                                */
-    /* --------------------------------------------------------- */
-
-    else if (
-        strcmp(
-            command,
-            "M3_UP"
-        ) == 0
-    )
-    {
-        Track_Stop();
-        Auto_MoveStop();
-
-        M1_Stop();
-        M2_Stop();
-
-
-        M3_Start(
-            GPIO_PIN_SET
-        );
-
-
-        UDP_SendReply(
-            "M3_UP",
-            addr,
-            port
-        );
-    }
-
-
-    /* --------------------------------------------------------- */
-    /* MOTOR 3 DOWN                                              */
-    /* --------------------------------------------------------- */
-
-    else if (
-        strcmp(
-            command,
-            "M3_DOWN"
-        ) == 0
-    )
-    {
-        Track_Stop();
-        Auto_MoveStop();
-
-        M1_Stop();
-        M2_Stop();
-
-
-        M3_Start(
-            GPIO_PIN_RESET
-        );
-
-
-        UDP_SendReply(
-            "M3_DOWN",
             addr,
             port
         );
@@ -1821,7 +1348,6 @@ static void UDP_ReceiveCallback(
         ) == 0
     )
     {
-        Track_Stop();
         /*
          * Auto_MoveStart:
          *
@@ -1832,10 +1358,15 @@ static void UDP_ReceiveCallback(
          * 5. Starts coordinated movement
          */
 
+        if (zero_reference_set == 0U)
+        {
+            UDP_SendReply("ZERO_REQUIRED", addr, port);
+        }
+        else
+        {
         Auto_MoveStart(
             START_M1_POSITION,
             START_M2_POSITION,
-            START_M3_POSITION,
             addr,
             port
         );
@@ -1849,27 +1380,9 @@ static void UDP_ReceiveCallback(
                 port
             );
         }
-    }
-
-
-    /* --------------------------------------------------------- */
-    /* TRACK STEP: signed M1/M3 step counts (max 10 each)        */
-    /* --------------------------------------------------------- */
-    else if (strncmp(command, "TRACK_STEP,", 11) == 0)
-    {
-        long steps1, steps3;
-        char extra;
-        if (sscanf(command, "TRACK_STEP,%ld,%ld%c", &steps1, &steps3, &extra) != 2 ||
-            steps1 < -TRACK_MAX_STEPS || steps1 > TRACK_MAX_STEPS ||
-            steps3 < -TRACK_MAX_STEPS || steps3 > TRACK_MAX_STEPS)
-        {
-            UDP_SendReply("TRACK_INVALID", addr, port);
-        }
-        else
-        {
-            Track_Start((int32_t)steps1, (int32_t)steps3, addr, port);
         }
     }
+
 
     /* --------------------------------------------------------- */
     /* STOP                                                      */
@@ -1882,7 +1395,6 @@ static void UDP_ReceiveCallback(
         ) == 0
     )
     {
-        Track_Stop();
         Auto_MoveStop();
         Stop_All_Motors();
 
@@ -1909,13 +1421,13 @@ static void UDP_ReceiveCallback(
         ) == 0
     )
     {
-        Track_Stop();
         Auto_MoveStop();
 
         Stop_All_Motors();
 
 
         Reset_Position();
+        zero_reference_set = 1U;
 
 
         UDP_SendReply(
@@ -1991,7 +1503,6 @@ int main(void)
     Stop_All_Motors();
 
     Auto_MoveStop();
-    Track_Stop();
     manual_mode_active = 0U;
 
     Reset_Position();
@@ -2011,10 +1522,7 @@ int main(void)
 
         M2_Process();
 
-        M3_Process();
-
         Auto_MoveProcess();
-        Track_Process();
     }
 }
 
@@ -2245,8 +1753,7 @@ static void MX_GPIO_Init(void)
     HAL_GPIO_WritePin(
         GPIOF,
         M1_step_Pin |
-        M2_dir_Pin |
-        M3_dir_Pin,
+        M2_dir_Pin,
         GPIO_PIN_RESET
     );
 
@@ -2255,16 +1762,14 @@ static void MX_GPIO_Init(void)
         GPIOE,
         M1_dir_Pin |
         M2_break_Pin |
-        M2_step_Pin |
-        M3_step_Pin,
+        M2_step_Pin,
         GPIO_PIN_RESET
     );
 
 
     GPIO_InitStruct.Pin =
         M1_step_Pin |
-        M2_dir_Pin |
-        M3_dir_Pin;
+        M2_dir_Pin;
 
     GPIO_InitStruct.Mode =
         GPIO_MODE_OUTPUT_PP;
@@ -2285,8 +1790,7 @@ static void MX_GPIO_Init(void)
     GPIO_InitStruct.Pin =
         M1_dir_Pin |
         M2_break_Pin |
-        M2_step_Pin |
-        M3_step_Pin;
+        M2_step_Pin;
 
     GPIO_InitStruct.Mode =
         GPIO_MODE_OUTPUT_PP;
@@ -2363,7 +1867,6 @@ void MPU_Config(void)
     );
 }
 
-
 /**
   * @brief Error handler
   */
@@ -2375,7 +1878,6 @@ void Error_Handler(void)
     {
     }
 }
-
 
 #ifdef USE_FULL_ASSERT
 
